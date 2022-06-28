@@ -26,6 +26,7 @@
 #include "libavformat/avformat.h"
 #include "libavformat/url.h"
 #include "libavutil/opt.h"
+#include "libavutil/time.h"
 
 #define BLURAY_PROTO_PREFIX     "bluray:"
 #define MIN_PLAYLIST_LENGTH     180     /* 3 min */
@@ -38,6 +39,8 @@ typedef struct {
     int playlist;
     int angle;
     int chapter;
+    URLContext *sub_url;
+    AVDictionary *avio_opts;
     /*int region;*/
 } BlurayContext;
 
@@ -107,8 +110,41 @@ static int bluray_close(URLContext *h)
     if (bd->bd) {
         bd_close(bd->bd);
     }
-
+    av_dict_free(&bd->avio_opts);
+    ffurl_close(bd->sub_url);
+    
     return 0;
+}
+
+static int bluray_http_read_blocks(void *handle, void *buf, int lba, int num_blocks)
+{
+    int target_size = 2048 * num_blocks;
+    int rsize;
+    char *p = buf;
+    BlurayContext *bd = ((URLContext*)handle)->priv_data;
+    av_log(handle, AV_LOG_DEBUG, "bluray http read lba:%d, num_blocks:%d\n", lba, num_blocks);
+
+    if(ffurl_seek(bd->sub_url, ((int64_t)lba) * 2048, SEEK_SET) < 0)
+    {
+        av_log(handle, AV_LOG_ERROR, "bluray http seek error\n");
+        return AVERROR(EIO);
+    }
+    while(target_size > 0)
+    {
+        rsize = ffurl_read(bd->sub_url, p, target_size);
+        av_log(handle, AV_LOG_DEBUG, "bluray http rsize:%d\n", rsize);
+        if(rsize < 0 && rsize != AVERROR(EAGAIN))
+        {
+            return 0;
+        }
+        target_size -= rsize;
+        if(target_size > 0)
+        {
+            p += rsize;
+            av_usleep(1000);
+        }
+    }
+    return num_blocks;
 }
 
 static int bluray_open(URLContext *h, const char *path, int flags)
@@ -119,7 +155,34 @@ static int bluray_open(URLContext *h, const char *path, int flags)
 
     av_strstart(path, BLURAY_PROTO_PREFIX, &diskname);
 
-    bd->bd = bd_open(diskname, NULL);
+    if(av_stristart(diskname, "http:", NULL))
+    {
+        BLURAY *_bd;
+        _bd = bd_init();
+        if (!_bd) {
+            return AVERROR(EIO);
+        }
+        if(ffurl_alloc(&bd->sub_url , diskname, AVIO_FLAG_READ, NULL) < 0)
+        {
+            return AVERROR(EIO);
+        }
+        av_dict_set_int(&bd->avio_opts, "seekable", 1, 0);
+        bd->sub_url->is_streamed = 0;
+        av_log(h, AV_LOG_INFO, "bluray protocol:%s\n", bd->sub_url->prot->name);
+        if(ffurl_connect(bd->sub_url, &bd->avio_opts))
+	{
+	    av_log(h, AV_LOG_ERROR, "bluray http connect error\n");
+	    return AVERROR(EIO);
+	}
+        if (!bd_open_stream(_bd, h, bluray_http_read_blocks)) {
+            bd_close(_bd);
+            return AVERROR(EIO);
+        }
+        bd->bd = _bd;
+    }else
+    {
+        bd->bd = bd_open(diskname, NULL);
+    }
     if (!bd->bd) {
         av_log(h, AV_LOG_ERROR, "bd_open() failed\n");
         return AVERROR(EIO);
